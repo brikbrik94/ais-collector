@@ -1,0 +1,20 @@
+[Unit]
+Description=AIS-Catcher to InfluxDB Collector
+After=network-online.target influxdb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ais-collector.env
+ExecStart=/opt/ais-collector/venv/bin/python3 /opt/ais-collector/collector.py
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

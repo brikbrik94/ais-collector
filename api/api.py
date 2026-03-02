@@ -9,8 +9,11 @@ Part of oe5ith-tracker-ingest
 """
 
 import json
+import gzip
 import logging
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs, urlencode
@@ -30,6 +33,8 @@ LISTEN_PORT    = int(os.getenv("LISTEN_PORT", "8787"))
 CORS_ORIGIN    = os.getenv("CORS_ORIGIN",    "*")   # restrict in prod e.g. "https://karte.oe5ith.at"
 LOG_LEVEL      = os.getenv("LOG_LEVEL",      "INFO")
 MAX_HOURS      = float(os.getenv("MAX_HOURS", "24")) # safety cap
+AC_DB_URL      = os.getenv("AC_DB_URL", "https://downloads.adsbexchange.com/downloads/basic-ac-db.json.gz")
+AC_DB_REFRESH  = int(os.getenv("AC_DB_REFRESH_HOURS", "24")) * 3600  # seconds
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
@@ -39,8 +44,72 @@ logging.basicConfig(
 log = logging.getLogger("tracking-api")
 
 # ---------------------------------------------------------------------------
-# InfluxDB Flux query helper
+# ADS-B Exchange aircraft database
 # ---------------------------------------------------------------------------
+
+# In-memory dict: ICAO (uppercase) → {reg, type, desc, flag}
+_ac_db: dict = {}
+_ac_db_lock = threading.Lock()
+_ac_db_loaded = threading.Event()
+
+
+def _load_ac_db() -> None:
+    """Download and parse the ADS-B Exchange basic-ac-db.json.gz into memory."""
+    global _ac_db
+    log.info("Loading aircraft DB from %s ...", AC_DB_URL)
+    try:
+        req = Request(AC_DB_URL, headers={"User-Agent": "oe5ith-tracking-api/1.0"})
+        with urlopen(req, timeout=60) as resp:
+            compressed = resp.read()
+        raw = gzip.decompress(compressed).decode("utf-8")
+
+        # Format: NDJSON - one JSON object per line
+        # Each line: {"icao":"3C6586","r":"OE-LNJ","t":"B738","desc":"Boeing 737NG 800","f":"AT",...}
+        db = {}
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            icao = entry.get("icao", "")
+            if not icao:
+                continue
+            db[icao.upper()] = {
+                "registration": entry.get("reg", ""),
+                "type":         entry.get("short_type", "") or entry.get("icaotype", ""),
+                "desc":         entry.get("model", "") or entry.get("manufacturer", ""),
+                "operator":     entry.get("ownop", ""),
+                "military":     entry.get("mil", False),
+                "year":         entry.get("year", ""),
+            }
+
+        with _ac_db_lock:
+            _ac_db = db
+
+        log.info("Aircraft DB loaded: %d entries", len(db))
+        _ac_db_loaded.set()
+
+    except Exception as e:
+        log.warning("Failed to load aircraft DB: %s", e)
+        _ac_db_loaded.set()  # Don't block startup on failure
+
+
+def _ac_db_refresh_loop() -> None:
+    """Background thread: reload aircraft DB every AC_DB_REFRESH seconds."""
+    while True:
+        time.sleep(AC_DB_REFRESH)
+        _load_ac_db()
+
+
+def ac_lookup(icao: str) -> dict:
+    """Return registration/type info for an ICAO code, or empty dict if unknown."""
+    with _ac_db_lock:
+        return _ac_db.get(icao.upper(), {})
+
+
 
 def flux_query(query: str) -> list[dict]:
     """
@@ -130,16 +199,24 @@ from(bucket: "{INFLUXDB_BUCKET}")
     out = []
     for r in rows:
         try:
+            icao = r.get("Icao", "")
+            db   = ac_lookup(icao)
             out.append({
-                "icao":      r.get("Icao", ""),
-                "callsign":  r.get("Call", ""),
-                "lat":       _f(r.get("Lat")),
-                "lon":       _f(r.get("Long")),
-                "alt":       _f(r.get("Alt")),
-                "speed":     _f(r.get("Spd")),
-                "track":     _f(r.get("Trak")),
-                "vsi":       _f(r.get("Vsi")),
-                "time":      r.get("_time", ""),
+                "icao":         icao,
+                "callsign":     r.get("Call", ""),
+                "registration": db.get("registration", ""),
+                "type":         db.get("type", ""),
+                "desc":         db.get("desc", ""),
+                "operator":     db.get("operator", ""),
+                "military":     db.get("military", False),
+                "year":         db.get("year", ""),
+                "lat":          _f(r.get("Lat")),
+                "lon":          _f(r.get("Long")),
+                "alt":          _f(r.get("Alt")),
+                "speed":        _f(r.get("Spd")),
+                "track":        _f(r.get("Trak")),
+                "vsi":          _f(r.get("Vsi")),
+                "time":         r.get("_time", ""),
             })
         except (ValueError, KeyError):
             continue
@@ -163,6 +240,7 @@ from(bucket: "{INFLUXDB_BUCKET}")
   |> sort(columns: ["_time"])
 """
     rows = flux_query(q)
+    db   = ac_lookup(icao)
     out = []
     for r in rows:
         try:
@@ -176,7 +254,17 @@ from(bucket: "{INFLUXDB_BUCKET}")
             })
         except (ValueError, KeyError):
             continue
-    return [x for x in out if x["lat"] is not None and x["lon"] is not None]
+    track = [x for x in out if x["lat"] is not None and x["lon"] is not None]
+    return {
+        "icao":         icao.upper(),
+        "registration": db.get("registration", ""),
+        "type":         db.get("type", ""),
+        "desc":         db.get("desc", ""),
+        "operator":     db.get("operator", ""),
+        "military":     db.get("military", False),
+        "year":         db.get("year", ""),
+        "track":        track,
+    }
 
 
 def query_vessels_latest(hours: float) -> list[dict]:
@@ -318,7 +406,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             # --- Health ---
             if path == "/api/health":
-                self._send_json({"status": "ok", "time": datetime.now(timezone.utc).isoformat()})
+                with _ac_db_lock:
+                    db_size = len(_ac_db)
+                self._send_json({
+                    "status": "ok",
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "ac_db_entries": db_size,
+                })
 
             # --- Aircraft latest ---
             elif path == "/api/aircraft":
@@ -331,7 +425,7 @@ class Handler(BaseHTTPRequestHandler):
                 icao  = path.split("/")[3]
                 hours = self._get_hours(qs, 1.0)
                 data  = query_aircraft_track(icao, hours)
-                self._send_json({"icao": icao, "hours": hours, "count": len(data), "track": data})
+                self._send_json({"hours": hours, "count": len(data["track"]), **data})
 
             # --- Vessels latest ---
             elif path == "/api/vessels":
@@ -368,6 +462,14 @@ def main():
     log.info("Tracking API starting on %s:%d", LISTEN_HOST, LISTEN_PORT)
     log.info("  InfluxDB: %s  org=%s  bucket=%s", INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET)
     log.info("  Max query window: %.0fh", MAX_HOURS)
+
+    # Load aircraft DB in background, don't block startup
+    t = threading.Thread(target=_load_ac_db, daemon=True)
+    t.start()
+
+    # Background refresh thread
+    r = threading.Thread(target=_ac_db_refresh_loop, daemon=True)
+    r.start()
 
     server = HTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     try:

@@ -59,30 +59,42 @@ def flux_query(query: str) -> list[dict]:
         with urlopen(req, timeout=15) as resp:
             raw = resp.read().decode("utf-8")
     except URLError as e:
-        log.error("InfluxDB query failed: %s", e)
-        raise RuntimeError(f"InfluxDB unreachable: {e}") from e
+        body = ""
+        try:
+            body = e.read().decode("utf-8")
+        except Exception:
+            pass
+        log.error("InfluxDB query failed: %s | %s", e, body)
+        raise RuntimeError(f"InfluxDB error: {e} | {body}") from e
 
     return _parse_flux_csv(raw)
 
 
 def _parse_flux_csv(csv_text: str) -> list[dict]:
-    """Parse InfluxDB annotated CSV into a list of plain dicts."""
+    """Parse InfluxDB annotated CSV into a list of plain dicts.
+    
+    InfluxDB returns multiple table blocks, each with its own header row.
+    We need to reset headers whenever we see a new header row.
+    """
     rows = []
     headers = []
     for line in csv_text.splitlines():
-        if not line or line.startswith("#"):
+        if not line:
+            continue
+        # Annotation rows (#group, #datatype, #default) - skip
+        if line.startswith("#"):
             continue
         parts = line.split(",")
-        if parts[0] == "":  # annotation rows start with empty first cell
-            continue
-        if not headers:
+        # Header row: first cell is empty, second cell is "result"
+        if parts[0] == "" and len(parts) > 1 and parts[1] == "result":
             headers = parts
             continue
-        row = dict(zip(headers, parts))
-        # Remove InfluxDB internal columns
-        for k in ("", "result", "table"):
-            row.pop(k, None)
-        rows.append(row)
+        # Data row: first cell is empty, second cell is "_result"
+        if parts[0] == "" and headers:
+            row = dict(zip(headers, parts))
+            for k in ("", "result", "table"):
+                row.pop(k, None)
+            rows.append(row)
     return rows
 
 
@@ -93,19 +105,25 @@ def _parse_flux_csv(csv_text: str) -> list[dict]:
 def _clamp_hours(hours: float) -> float:
     return max(0.0167, min(hours, MAX_HOURS))  # min ~1 min, max cap
 
+def _flux_duration(hours: float) -> str:
+    """Convert hours to a Flux duration string using whole minutes (always valid)."""
+    minutes = max(1, round(hours * 60))
+    return f"{minutes}m"
+
 
 def query_aircraft_latest(hours: float) -> list[dict]:
     """Last known position of every aircraft seen in the time window."""
     h = _clamp_hours(hours)
+    dur = _flux_duration(h)
     q = f"""
 from(bucket: "{INFLUXDB_BUCKET}")
-  |> range(start: -{h}h)
+  |> range(start: -{dur})
   |> filter(fn: (r) => r._measurement == "aircraft")
   |> filter(fn: (r) => r._field == "Lat" or r._field == "Long" or
                         r._field == "Alt" or r._field == "Spd" or
                         r._field == "Trak" or r._field == "Vsi")
   |> last()
-  |> pivot(rowKey: ["_time", "Icao", "Call"], columnKey: ["_field"], valueColumn: "_value")
+  |> pivot(rowKey: ["_time", "Icao"], columnKey: ["_field"], valueColumn: "_value")
   |> keep(columns: ["_time", "Icao", "Call", "Lat", "Long", "Alt", "Spd", "Trak", "Vsi"])
 """
     rows = flux_query(q)
@@ -131,15 +149,16 @@ from(bucket: "{INFLUXDB_BUCKET}")
 def query_aircraft_track(icao: str, hours: float) -> list[dict]:
     """Full position track for a single aircraft."""
     h = _clamp_hours(hours)
+    dur = _flux_duration(h)
     icao_safe = icao.upper().replace('"', "")
     q = f"""
 from(bucket: "{INFLUXDB_BUCKET}")
-  |> range(start: -{h}h)
+  |> range(start: -{dur})
   |> filter(fn: (r) => r._measurement == "aircraft")
   |> filter(fn: (r) => r.Icao == "{icao_safe}")
   |> filter(fn: (r) => r._field == "Lat" or r._field == "Long" or
                         r._field == "Alt" or r._field == "Spd" or r._field == "Trak")
-  |> pivot(rowKey: ["_time", "Icao", "Call"], columnKey: ["_field"], valueColumn: "_value")
+  |> pivot(rowKey: ["_time", "Icao"], columnKey: ["_field"], valueColumn: "_value")
   |> keep(columns: ["_time", "Lat", "Long", "Alt", "Spd", "Trak"])
   |> sort(columns: ["_time"])
 """
@@ -163,15 +182,16 @@ from(bucket: "{INFLUXDB_BUCKET}")
 def query_vessels_latest(hours: float) -> list[dict]:
     """Last known position of every vessel seen in the time window."""
     h = _clamp_hours(hours)
+    dur = _flux_duration(h)
     q = f"""
 from(bucket: "{INFLUXDB_BUCKET}")
-  |> range(start: -{h}h)
+  |> range(start: -{dur})
   |> filter(fn: (r) => r._measurement == "vessel")
   |> filter(fn: (r) => r._field == "lat" or r._field == "lon" or
                         r._field == "speed" or r._field == "course" or
                         r._field == "heading" or r._field == "status")
   |> last()
-  |> pivot(rowKey: ["_time", "mmsi", "shipname", "shiptype", "country"], columnKey: ["_field"], valueColumn: "_value")
+  |> pivot(rowKey: ["_time", "mmsi"], columnKey: ["_field"], valueColumn: "_value")
   |> keep(columns: ["_time", "mmsi", "shipname", "shiptype", "country",
                      "lat", "lon", "speed", "course", "heading", "status"])
 """
@@ -200,10 +220,11 @@ from(bucket: "{INFLUXDB_BUCKET}")
 def query_vessel_track(mmsi: str, hours: float) -> list[dict]:
     """Full position track for a single vessel."""
     h = _clamp_hours(hours)
+    dur = _flux_duration(h)
     mmsi_safe = mmsi.replace('"', "")
     q = f"""
 from(bucket: "{INFLUXDB_BUCKET}")
-  |> range(start: -{h}h)
+  |> range(start: -{dur})
   |> filter(fn: (r) => r._measurement == "vessel")
   |> filter(fn: (r) => r.mmsi == "{mmsi_safe}")
   |> filter(fn: (r) => r._field == "lat" or r._field == "lon" or

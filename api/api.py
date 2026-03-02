@@ -16,12 +16,12 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
 # ---------------------------------------------------------------------------
-# Configuration (via environment variables)
+# Configuration
 # ---------------------------------------------------------------------------
 
 INFLUXDB_URL    = os.getenv("INFLUXDB_URL",    "http://127.0.0.1:8086")
@@ -59,7 +59,6 @@ def _load_ac_db() -> None:
         with urlopen(req, timeout=60) as resp:
             compressed = resp.read()
         raw = gzip.decompress(compressed).decode("utf-8")
-
         db = {}
         for line in raw.splitlines():
             line = line.strip()
@@ -80,12 +79,9 @@ def _load_ac_db() -> None:
                 "military":     entry.get("mil", False),
                 "year":         entry.get("year", ""),
             }
-
         with _ac_db_lock:
             _ac_db = db
-
         log.info("Aircraft DB loaded: %d entries", len(db))
-
     except Exception as e:
         log.warning("Failed to load aircraft DB: %s", e)
 
@@ -108,12 +104,10 @@ def ac_lookup(icao: str) -> dict:
 def flux_query(query: str) -> list[dict]:
     url = f"{INFLUXDB_URL}/api/v2/query?org={INFLUXDB_ORG}"
     payload = json.dumps({"query": query, "type": "flux"}).encode()
-
     req = Request(url, data=payload, method="POST")
     req.add_header("Authorization", f"Token {INFLUXDB_TOKEN}")
     req.add_header("Content-Type",  "application/json")
     req.add_header("Accept",        "application/csv")
-
     try:
         with urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8")
@@ -125,7 +119,6 @@ def flux_query(query: str) -> list[dict]:
             pass
         log.error("InfluxDB query failed: %s | %s", e, body)
         raise RuntimeError(f"InfluxDB error: {e} | {body}") from e
-
     return _parse_flux_csv(raw)
 
 
@@ -133,9 +126,7 @@ def _parse_flux_csv(csv_text: str) -> list[dict]:
     rows = []
     headers = []
     for line in csv_text.splitlines():
-        if not line:
-            continue
-        if line.startswith("#"):
+        if not line or line.startswith("#"):
             continue
         parts = line.split(",")
         if parts[0] == "" and len(parts) > 1 and parts[1] == "result":
@@ -157,8 +148,15 @@ def _clamp_hours(hours: float) -> float:
     return max(0.0167, min(hours, MAX_HOURS))
 
 def _flux_duration(hours: float) -> str:
-    minutes = max(1, round(hours * 60))
-    return f"{minutes}m"
+    return f"{max(1, round(hours * 60))}m"
+
+def _parse_duration_min(first_seen: str, last_seen: str):
+    try:
+        t0 = datetime.strptime(first_seen[:19], "%Y-%m-%dT%H:%M:%S")
+        t1 = datetime.strptime(last_seen[:19],  "%Y-%m-%dT%H:%M:%S")
+        return round((t1 - t0).total_seconds() / 60, 1)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -326,47 +324,51 @@ from(bucket: "{INFLUXDB_BUCKET}")
 # Stats queries
 # ---------------------------------------------------------------------------
 
-def _parse_duration_min(first_seen: str, last_seen: str):
-    try:
-        fmt = "%Y-%m-%dT%H:%M:%S"
-        t0 = datetime.strptime(first_seen[:19], fmt)
-        t1 = datetime.strptime(last_seen[:19],  fmt)
-        return round((t1 - t0).total_seconds() / 60, 1)
-    except Exception:
-        return None
-
-
 def query_stats_aircraft(hours: float, limit: int = 20) -> dict:
+    """
+    Three separate Flux queries:
+    1. count per ICAO
+    2. first seen per ICAO
+    3. last seen per ICAO
+    Joined in Python.
+    """
     h   = _clamp_hours(hours)
     dur = _flux_duration(h)
-    q = f"""
+
+    q_count = f"""
 from(bucket: "{INFLUXDB_BUCKET}")
   |> range(start: -{dur})
-  |> filter(fn: (r) => r._measurement == "aircraft")
-  |> filter(fn: (r) => r._field == "Lat")
+  |> filter(fn: (r) => r._measurement == "aircraft" and r._field == "Lat")
   |> group(columns: ["Icao"])
-  |> reduce(
-      identity: {{count: 0, first_seen: "", last_seen: ""}},
-      fn: (r, accumulator) => ({{
-          count:      accumulator.count + 1,
-          first_seen: if accumulator.first_seen == "" or r._time < accumulator.first_seen
-                      then string(v: r._time) else accumulator.first_seen,
-          last_seen:  if accumulator.last_seen == "" or r._time > accumulator.last_seen
-                      then string(v: r._time) else accumulator.last_seen,
-      }})
-  )
-  |> keep(columns: ["Icao", "count", "first_seen", "last_seen"])
+  |> count()
+  |> keep(columns: ["Icao", "_value"])
 """
-    rows = flux_query(q)
+    q_first = f"""
+from(bucket: "{INFLUXDB_BUCKET}")
+  |> range(start: -{dur})
+  |> filter(fn: (r) => r._measurement == "aircraft" and r._field == "Lat")
+  |> group(columns: ["Icao"])
+  |> first()
+  |> keep(columns: ["Icao", "_time"])
+"""
+    q_last = f"""
+from(bucket: "{INFLUXDB_BUCKET}")
+  |> range(start: -{dur})
+  |> filter(fn: (r) => r._measurement == "aircraft" and r._field == "Lat")
+  |> group(columns: ["Icao"])
+  |> last()
+  |> keep(columns: ["Icao", "_time"])
+"""
+
+    counts = {r["Icao"]: _i(r.get("_value")) or 0 for r in flux_query(q_count) if r.get("Icao")}
+    firsts = {r["Icao"]: r.get("_time", "") for r in flux_query(q_first) if r.get("Icao")}
+    lasts  = {r["Icao"]: r.get("_time", "") for r in flux_query(q_last)  if r.get("Icao")}
 
     entries = []
-    for r in rows:
-        icao = r.get("Icao", "")
-        if not icao:
-            continue
-        db  = ac_lookup(icao)
-        first_seen = r.get("first_seen", "")
-        last_seen  = r.get("last_seen",  "")
+    for icao, count in counts.items():
+        db         = ac_lookup(icao)
+        first_seen = firsts.get(icao, "")
+        last_seen  = lasts.get(icao, "")
         entries.append({
             "icao":         icao,
             "registration": db.get("registration", ""),
@@ -374,15 +376,17 @@ from(bucket: "{INFLUXDB_BUCKET}")
             "desc":         db.get("desc", ""),
             "operator":     db.get("operator", ""),
             "military":     db.get("military", False),
-            "count":        _i(r.get("count")) or 0,
+            "count":        count,
             "first_seen":   first_seen,
             "last_seen":    last_seen,
             "duration_min": _parse_duration_min(first_seen, last_seen),
         })
 
-    top_count    = sorted(entries, key=lambda x: x["count"],                          reverse=True)[:limit]
-    top_duration = sorted([e for e in entries if e["duration_min"] is not None],
-                          key=lambda x: x["duration_min"],                             reverse=True)[:limit]
+    top_count    = sorted(entries, key=lambda x: x["count"], reverse=True)[:limit]
+    top_duration = sorted(
+        [e for e in entries if e["duration_min"] is not None],
+        key=lambda x: x["duration_min"], reverse=True
+    )[:limit]
 
     return {
         "hours":        hours,
@@ -395,47 +399,59 @@ from(bucket: "{INFLUXDB_BUCKET}")
 def query_stats_vessels(hours: float, limit: int = 20) -> dict:
     h   = _clamp_hours(hours)
     dur = _flux_duration(h)
-    q = f"""
+
+    q_count = f"""
 from(bucket: "{INFLUXDB_BUCKET}")
   |> range(start: -{dur})
-  |> filter(fn: (r) => r._measurement == "vessel")
-  |> filter(fn: (r) => r._field == "lat")
+  |> filter(fn: (r) => r._measurement == "vessel" and r._field == "lat")
   |> group(columns: ["mmsi", "shipname", "country", "shiptype"])
-  |> reduce(
-      identity: {{count: 0, first_seen: "", last_seen: ""}},
-      fn: (r, accumulator) => ({{
-          count:      accumulator.count + 1,
-          first_seen: if accumulator.first_seen == "" or r._time < accumulator.first_seen
-                      then string(v: r._time) else accumulator.first_seen,
-          last_seen:  if accumulator.last_seen == "" or r._time > accumulator.last_seen
-                      then string(v: r._time) else accumulator.last_seen,
-      }})
-  )
-  |> keep(columns: ["mmsi", "shipname", "country", "shiptype", "count", "first_seen", "last_seen"])
+  |> count()
+  |> keep(columns: ["mmsi", "shipname", "country", "shiptype", "_value"])
 """
-    rows = flux_query(q)
+    q_first = f"""
+from(bucket: "{INFLUXDB_BUCKET}")
+  |> range(start: -{dur})
+  |> filter(fn: (r) => r._measurement == "vessel" and r._field == "lat")
+  |> group(columns: ["mmsi"])
+  |> first()
+  |> keep(columns: ["mmsi", "_time"])
+"""
+    q_last = f"""
+from(bucket: "{INFLUXDB_BUCKET}")
+  |> range(start: -{dur})
+  |> filter(fn: (r) => r._measurement == "vessel" and r._field == "lat")
+  |> group(columns: ["mmsi"])
+  |> last()
+  |> keep(columns: ["mmsi", "_time"])
+"""
+
+    counts_raw = flux_query(q_count)
+    firsts = {r["mmsi"]: r.get("_time", "") for r in flux_query(q_first) if r.get("mmsi")}
+    lasts  = {r["mmsi"]: r.get("_time", "") for r in flux_query(q_last)  if r.get("mmsi")}
 
     entries = []
-    for r in rows:
+    for r in counts_raw:
         mmsi = r.get("mmsi", "")
         if not mmsi:
             continue
-        first_seen = r.get("first_seen", "")
-        last_seen  = r.get("last_seen",  "")
+        first_seen = firsts.get(mmsi, "")
+        last_seen  = lasts.get(mmsi, "")
         entries.append({
             "mmsi":         mmsi,
             "name":         r.get("shipname", ""),
             "country":      r.get("country", ""),
             "type":         r.get("shiptype", ""),
-            "count":        _i(r.get("count")) or 0,
+            "count":        _i(r.get("_value")) or 0,
             "first_seen":   first_seen,
             "last_seen":    last_seen,
             "duration_min": _parse_duration_min(first_seen, last_seen),
         })
 
-    top_count    = sorted(entries, key=lambda x: x["count"],                          reverse=True)[:limit]
-    top_duration = sorted([e for e in entries if e["duration_min"] is not None],
-                          key=lambda x: x["duration_min"],                             reverse=True)[:limit]
+    top_count    = sorted(entries, key=lambda x: x["count"], reverse=True)[:limit]
+    top_duration = sorted(
+        [e for e in entries if e["duration_min"] is not None],
+        key=lambda x: x["duration_min"], reverse=True
+    )[:limit]
 
     return {
         "hours":        hours,
@@ -471,19 +487,19 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log.debug("HTTP %s", fmt % args)
 
-    def _get_hours(self, qs: dict, default: float = 1.0) -> float:
+    def _get_hours(self, qs, default=1.0):
         try:
             return float(qs.get("hours", [default])[0])
         except (ValueError, TypeError):
             return default
 
-    def _get_int(self, qs: dict, key: str, default: int) -> int:
+    def _get_int(self, qs, key, default):
         try:
             return int(qs.get(key, [default])[0])
         except (ValueError, TypeError):
             return default
 
-    def _send_json(self, data, status: int = 200):
+    def _send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type",   "application/json; charset=utf-8")
@@ -493,7 +509,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _error(self, status: int, msg: str):
+    def _error(self, status, msg):
         self._send_json({"error": msg}, status)
 
     def do_OPTIONS(self):
@@ -532,8 +548,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/stats/aircraft":
                 hours = self._get_hours(qs, 24.0)
                 limit = self._get_int(qs, "limit", 20)
-                data  = query_stats_aircraft(hours, limit)
-                self._send_json(data)
+                self._send_json(query_stats_aircraft(hours, limit))
 
             elif path == "/api/vessels":
                 hours = self._get_hours(qs, 1.0)
@@ -549,8 +564,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/stats/vessels":
                 hours = self._get_hours(qs, 24.0)
                 limit = self._get_int(qs, "limit", 20)
-                data  = query_stats_vessels(hours, limit)
-                self._send_json(data)
+                self._send_json(query_stats_vessels(hours, limit))
 
             else:
                 self._error(404, "Not found")

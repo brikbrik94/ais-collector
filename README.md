@@ -5,15 +5,15 @@ Sammelt ADS-B Flugzeug- und AIS Schiffsdaten und speichert sie in InfluxDB v2 zu
 ## Architektur
 
 ```
-┌─────────────────┐     Beast/TCP      ┌──────────┐   built-in    ┌────────────┐
+┌─────────────────┐     Beast/TCP       ┌──────────┐   built-in    ┌────────────┐
 │ ADS-B Feeders   │ ──────────────────► │  readsb  │ ──Telegraf──► │            │
-│ (RPi / Debian)  │   via Headscale    │ (Docker)  │              │            │
-└─────────────────┘                     └──────────┘              │ InfluxDB   │
+│ (RPi / Debian)  │   via Headscale     │ (Docker) │               │            │
+└─────────────────┘                     └──────────┘               │ InfluxDB   │
                                                                    │ v2         │
-┌─────────────────┐     HTTP/JSON       ┌───────────────┐         │            │
+┌─────────────────┐     HTTP/JSON       ┌───────────────┐          │            │
 │ AIS-Catcher     │ ──────────────────► │ ais-collector │ ───────► │            │
-│ (RPi 4)         │   via Headscale    │ (Python)      │         │            │
-└─────────────────┘                     └───────────────┘         └────────────┘
+│ (RPi 4)         │   via Headscale     │ (Python)      │          │            │
+└─────────────────┘                     └───────────────┘          └────────────┘
                                                                         │
                                                                    ┌────▼────────┐
                                                                    │ tracking-   │

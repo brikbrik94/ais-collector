@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tracking API Test · OE5ITH</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;700&display=swap');
+
+  :root {
+    --bg: #0b0e14;
+    --panel: #111620;
+    --border: #1e2535;
+    --accent: #00e5ff;
+    --accent2: #ff6b35;
+    --green: #39ff8a;
+    --red: #ff3d5a;
+    --text: #c8d8e8;
+    --muted: #4a5a72;
+    --base: http://100.64.0.1:8787;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    min-height: 100vh;
+    padding: 24px;
+  }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 28px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  header h1 {
+    font-family: 'Syne', sans-serif;
+    font-size: 22px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+  }
+
+  header .tag {
+    font-size: 11px;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    padding: 2px 8px;
+    border-radius: 2px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 16px;
+    height: calc(100vh - 100px);
+  }
+
+  .sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+
+  .card-header {
+    padding: 10px 14px;
+    background: #0d1219;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .card-header .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--muted);
+  }
+  .dot.green { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.red   { background: var(--red);   box-shadow: 0 0 6px var(--red); }
+
+  .card-body { padding: 14px; }
+
+  /* Endpoint buttons */
+  .endpoint-btn {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    padding: 9px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    margin-bottom: 6px;
+    transition: all 0.15s;
+    line-height: 1.5;
+  }
+
+  .endpoint-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .endpoint-btn:last-child { margin-bottom: 0; }
+
+  .endpoint-btn .method {
+    color: var(--accent2);
+    font-weight: 700;
+    font-size: 10px;
+    margin-right: 6px;
+  }
+
+  .endpoint-btn .path { color: #fff; }
+  .endpoint-btn .desc {
+    display: block;
+    color: var(--muted);
+    font-size: 11px;
+    margin-top: 2px;
+    padding-left: 30px;
+  }
+
+  /* Hours slider */
+  .param-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+
+  .param-row label { color: var(--muted); font-size: 11px; min-width: 50px; }
+
+  input[type=range] {
+    flex: 1;
+    accent-color: var(--accent);
+  }
+
+  .param-val {
+    min-width: 40px;
+    text-align: right;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  input[type=text] {
+    width: 100%;
+    background: #0d1219;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    padding: 7px 10px;
+    margin-bottom: 8px;
+    outline: none;
+  }
+
+  input[type=text]:focus { border-color: var(--accent); }
+
+  .btn-run {
+    width: 100%;
+    background: var(--accent);
+    color: #000;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: 12px;
+    border: none;
+    border-radius: 4px;
+    padding: 9px;
+    cursor: pointer;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    transition: opacity 0.15s;
+  }
+
+  .btn-run:hover { opacity: 0.85; }
+  .btn-run:active { opacity: 0.7; }
+
+  /* Output */
+  .output-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .output-toolbar {
+    background: #0d1219;
+    border: 1px solid var(--border);
+    border-bottom: none;
+    border-radius: 6px 6px 0 0;
+    padding: 8px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .output-toolbar .url-display {
+    color: var(--accent);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 60%;
+  }
+
+  .status-badge {
+    padding: 2px 8px;
+    border-radius: 2px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+  }
+
+  .status-ok   { background: rgba(57,255,138,0.15); color: var(--green); }
+  .status-err  { background: rgba(255,61,90,0.15);  color: var(--red); }
+  .status-idle { background: rgba(74,90,114,0.2);   color: var(--muted); }
+
+  .output-body {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 0 0 6px 6px;
+    overflow: auto;
+    padding: 16px;
+  }
+
+  pre {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--text);
+  }
+
+  /* JSON syntax highlight */
+  .j-key    { color: #7ec8e3; }
+  .j-str    { color: #c3e88d; }
+  .j-num    { color: #f78c6c; }
+  .j-bool   { color: var(--accent2); }
+  .j-null   { color: var(--muted); }
+
+  .spinner {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    vertical-align: middle;
+    margin-right: 6px;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .stats-row {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+
+  .stat-chip {
+    background: #0d1219;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 11px;
+  }
+
+  .stat-chip span { color: var(--accent); font-weight: 700; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>OE5ITH Tracking API</h1>
+  <div class="tag">Test Console</div>
+  <div id="health-indicator" class="tag" style="border-color:var(--muted);color:var(--muted);">● connecting…</div>
+</header>
+
+<div class="grid">
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+
+    <div class="card">
+      <div class="card-header"><div class="dot" id="dot-health"></div>Endpoints</div>
+      <div class="card-body">
+        <button class="endpoint-btn" onclick="runEndpoint('/api/health')">
+          <span class="method">GET</span><span class="path">/api/health</span>
+          <span class="desc">Healthcheck</span>
+        </button>
+        <button class="endpoint-btn" onclick="runEndpoint('/api/aircraft')">
+          <span class="method">GET</span><span class="path">/api/aircraft</span>
+          <span class="desc">Alle Flugzeuge (letzte Position)</span>
+        </button>
+        <button class="endpoint-btn" onclick="runEndpoint('/api/aircraft/'+getIcao()+'/track')">
+          <span class="method">GET</span><span class="path">/api/aircraft/{icao}/track</span>
+          <span class="desc">Track eines Flugzeugs</span>
+        </button>
+        <button class="endpoint-btn" onclick="runEndpoint('/api/vessels')">
+          <span class="method">GET</span><span class="path">/api/vessels</span>
+          <span class="desc">Alle Schiffe (letzte Position)</span>
+        </button>
+        <button class="endpoint-btn" onclick="runEndpoint('/api/vessels/'+getMmsi()+'/track')">
+          <span class="method">GET</span><span class="path">/api/vessels/{mmsi}/track</span>
+          <span class="desc">Track eines Schiffes</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><div class="dot"></div>Parameter</div>
+      <div class="card-body">
+        <div class="param-row">
+          <label>hours</label>
+          <input type="range" id="hours-slider" min="0.083" max="24" step="0.083" value="1"
+                 oninput="document.getElementById('hours-val').textContent=parseFloat(this.value).toFixed(2)+'h'">
+          <div class="param-val" id="hours-val">1.00h</div>
+        </div>
+        <div class="param-row" style="margin-bottom:0">
+          <label style="min-width:50px">ICAO</label>
+          <input type="text" id="icao-input" placeholder="z.B. 3C6586" style="margin:0;flex:1">
+        </div>
+        <div style="height:8px"></div>
+        <div class="param-row" style="margin-bottom:0">
+          <label style="min-width:50px">MMSI</label>
+          <input type="text" id="mmsi-input" placeholder="z.B. 244780000" style="margin:0;flex:1">
+        </div>
+        <div style="height:12px"></div>
+
+        <div class="param-row">
+          <label>Base URL</label>
+        </div>
+        <input type="text" id="base-url" value="http://100.64.0.1:8787">
+        <button class="btn-run" onclick="runCustom()">▶ Run Custom URL</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Output -->
+  <div class="output-panel">
+    <div class="output-toolbar">
+      <div class="url-display" id="url-display">—</div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <div id="timing" style="color:var(--muted)"></div>
+        <div class="status-badge status-idle" id="status-badge">IDLE</div>
+      </div>
+    </div>
+    <div class="output-body">
+      <div class="stats-row" id="stats-row" style="display:none"></div>
+      <pre id="output">// Endpoint auswählen und ausführen…</pre>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const BASE = () => document.getElementById('base-url').value.replace(/\/$/, '');
+const hours = () => parseFloat(document.getElementById('hours-slider').value).toFixed(4);
+const getIcao = () => document.getElementById('icao-input').value.trim() || 'AABBCC';
+const getMmsi = () => document.getElementById('mmsi-input').value.trim() || '000000000';
+
+async function runEndpoint(path) {
+  const sep = path.includes('?') ? '&' : '?';
+  const url = BASE() + path + sep + 'hours=' + hours();
+  await fetchAndShow(url);
+}
+
+async function runCustom() {
+  const url = document.getElementById('base-url').value;
+  await fetchAndShow(url);
+}
+
+function syntaxHighlight(json) {
+  return json
+    .replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, match => {
+      let cls = 'j-num';
+      if (/^"/.test(match)) {
+        cls = /:$/.test(match) ? 'j-key' : 'j-str';
+      } else if (/true|false/.test(match)) {
+        cls = 'j-bool';
+      } else if (/null/.test(match)) {
+        cls = 'j-null';
+      }
+      return `<span class="${cls}">${match}</span>`;
+    });
+}
+
+function showStats(data) {
+  const row = document.getElementById('stats-row');
+  const chips = [];
+  if (data.count !== undefined)  chips.push(`<div class="stat-chip">count <span>${data.count}</span></div>`);
+  if (data.hours !== undefined)  chips.push(`<div class="stat-chip">hours <span>${data.hours}</span></div>`);
+  if (data.aircraft)             chips.push(`<div class="stat-chip">aircraft <span>${data.aircraft.length}</span></div>`);
+  if (data.vessels)              chips.push(`<div class="stat-chip">vessels <span>${data.vessels.length}</span></div>`);
+  if (data.track)                chips.push(`<div class="stat-chip">track pts <span>${data.track.length}</span></div>`);
+  if (chips.length) {
+    row.innerHTML = chips.join('');
+    row.style.display = 'flex';
+  } else {
+    row.style.display = 'none';
+  }
+}
+
+async function fetchAndShow(url) {
+  const out    = document.getElementById('output');
+  const badge  = document.getElementById('status-badge');
+  const timing = document.getElementById('timing');
+  const urlDisp = document.getElementById('url-display');
+
+  urlDisp.textContent = url;
+  badge.className = 'status-badge status-idle';
+  badge.innerHTML = '<span class="spinner"></span>LOADING';
+  out.innerHTML = '// Fetching…';
+  document.getElementById('stats-row').style.display = 'none';
+
+  const t0 = performance.now();
+  try {
+    const res = await fetch(url);
+    const ms = (performance.now() - t0).toFixed(0);
+    timing.textContent = ms + ' ms';
+
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = null; }
+
+    if (res.ok) {
+      badge.className = 'status-badge status-ok';
+      badge.textContent = res.status + ' OK';
+      if (data) showStats(data);
+    } else {
+      badge.className = 'status-badge status-err';
+      badge.textContent = res.status + ' ERR';
+    }
+
+    if (data) {
+      out.innerHTML = syntaxHighlight(JSON.stringify(data, null, 2));
+    } else {
+      out.textContent = text;
+    }
+  } catch (e) {
+    const ms = (performance.now() - t0).toFixed(0);
+    timing.textContent = ms + ' ms';
+    badge.className = 'status-badge status-err';
+    badge.textContent = 'FAILED';
+    out.textContent = '// Fehler: ' + e.message + '\n\n// Läuft der Service?\n// sudo systemctl status tracking-api';
+  }
+}
+
+// Health check on load
+async function checkHealth() {
+  const dot  = document.getElementById('dot-health');
+  const ind  = document.getElementById('health-indicator');
+  try {
+    const res = await fetch(BASE() + '/api/health');
+    if (res.ok) {
+      dot.className = 'dot green';
+      ind.style.borderColor = 'var(--green)';
+      ind.style.color = 'var(--green)';
+      ind.textContent = '● online';
+    } else {
+      throw new Error(res.status);
+    }
+  } catch {
+    dot.className = 'dot red';
+    ind.style.borderColor = 'var(--red)';
+    ind.style.color = 'var(--red)';
+    ind.textContent = '● offline';
+  }
+}
+
+checkHealth();
+setInterval(checkHealth, 15000);
+</script>
+</body>
+</html>

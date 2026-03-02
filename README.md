@@ -60,6 +60,7 @@ Leichtgewichtiger Python-Dienst der den AIS-Catcher `ships.json`-Endpoint pollt 
 
 **Installation:**
 ```bash
+cd ais-collector
 chmod +x install.sh
 ./install.sh
 
@@ -201,18 +202,19 @@ Feeder-Statistiken: Nachrichten/Sek, Flugzeuganzahl, Signalpegel, CPU-Auslastung
 ## Verzeichnisstruktur
 
 ```
-oe5ith-tracker-ingest/
+ais-collector/
 ├── README.md
-├── collector.py                # AIS → InfluxDB Collector
-├── ais-collector.service       # systemd Unit
-├── ais-collector.env.example
-├── install.sh                  # Installation ais-collector
+├── ais-collector/
+│   ├── collector.py                # AIS → InfluxDB Collector
+│   ├── ais-collector.service       # systemd Unit
+│   ├── ais-collector.env.example
+│   └── install.sh
 └── api/
     ├── README.md
-    ├── api.py                  # InfluxDB → JSON API
-    ├── tracking-api.service    # systemd Unit
+    ├── api.py                      # InfluxDB → JSON API
+    ├── tracking-api.service        # systemd Unit
     ├── tracking-api.env.example
-    └── install.sh              # Installation tracking-api
+    └── install.sh
 ```
 
 ---

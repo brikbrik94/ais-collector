@@ -24,17 +24,17 @@ from urllib.error import URLError
 # Configuration (via environment variables)
 # ---------------------------------------------------------------------------
 
-INFLUXDB_URL   = os.getenv("INFLUXDB_URL",   "http://127.0.0.1:8086")
-INFLUXDB_TOKEN = os.getenv("INFLUXDB_TOKEN", "")
-INFLUXDB_ORG   = os.getenv("INFLUXDB_ORG",   "OE5ITH")
-INFLUXDB_BUCKET= os.getenv("INFLUXDB_BUCKET","tracking")
-LISTEN_HOST    = os.getenv("LISTEN_HOST",    "127.0.0.1")
-LISTEN_PORT    = int(os.getenv("LISTEN_PORT", "8787"))
-CORS_ORIGIN    = os.getenv("CORS_ORIGIN",    "*")   # restrict in prod e.g. "https://karte.oe5ith.at"
-LOG_LEVEL      = os.getenv("LOG_LEVEL",      "INFO")
-MAX_HOURS      = float(os.getenv("MAX_HOURS", "24")) # safety cap
-AC_DB_URL      = os.getenv("AC_DB_URL", "https://downloads.adsbexchange.com/downloads/basic-ac-db.json.gz")
-AC_DB_REFRESH  = int(os.getenv("AC_DB_REFRESH_HOURS", "24")) * 3600  # seconds
+INFLUXDB_URL    = os.getenv("INFLUXDB_URL",    "http://127.0.0.1:8086")
+INFLUXDB_TOKEN  = os.getenv("INFLUXDB_TOKEN",  "")
+INFLUXDB_ORG    = os.getenv("INFLUXDB_ORG",    "OE5ITH")
+INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET", "tracking")
+LISTEN_HOST     = os.getenv("LISTEN_HOST",     "127.0.0.1")
+LISTEN_PORT     = int(os.getenv("LISTEN_PORT", "8787"))
+CORS_ORIGIN     = os.getenv("CORS_ORIGIN",     "*")
+LOG_LEVEL       = os.getenv("LOG_LEVEL",       "INFO")
+MAX_HOURS       = float(os.getenv("MAX_HOURS", "24"))
+AC_DB_URL       = os.getenv("AC_DB_URL", "https://downloads.adsbexchange.com/downloads/basic-ac-db.json.gz")
+AC_DB_REFRESH   = int(os.getenv("AC_DB_REFRESH_HOURS", "24")) * 3600
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
@@ -47,14 +47,11 @@ log = logging.getLogger("tracking-api")
 # ADS-B Exchange aircraft database
 # ---------------------------------------------------------------------------
 
-# In-memory dict: ICAO (uppercase) → {reg, type, desc, flag}
 _ac_db: dict = {}
 _ac_db_lock = threading.Lock()
-_ac_db_loaded = threading.Event()
 
 
 def _load_ac_db() -> None:
-    """Download and parse the ADS-B Exchange basic-ac-db.json.gz into memory."""
     global _ac_db
     log.info("Loading aircraft DB from %s ...", AC_DB_URL)
     try:
@@ -63,8 +60,6 @@ def _load_ac_db() -> None:
             compressed = resp.read()
         raw = gzip.decompress(compressed).decode("utf-8")
 
-        # Format: NDJSON - one JSON object per line
-        # Each line: {"icao":"3C6586","r":"OE-LNJ","t":"B738","desc":"Boeing 737NG 800","f":"AT",...}
         db = {}
         for line in raw.splitlines():
             line = line.strip()
@@ -90,42 +85,37 @@ def _load_ac_db() -> None:
             _ac_db = db
 
         log.info("Aircraft DB loaded: %d entries", len(db))
-        _ac_db_loaded.set()
 
     except Exception as e:
         log.warning("Failed to load aircraft DB: %s", e)
-        _ac_db_loaded.set()  # Don't block startup on failure
 
 
 def _ac_db_refresh_loop() -> None:
-    """Background thread: reload aircraft DB every AC_DB_REFRESH seconds."""
     while True:
         time.sleep(AC_DB_REFRESH)
         _load_ac_db()
 
 
 def ac_lookup(icao: str) -> dict:
-    """Return registration/type info for an ICAO code, or empty dict if unknown."""
     with _ac_db_lock:
         return _ac_db.get(icao.upper(), {})
 
 
+# ---------------------------------------------------------------------------
+# InfluxDB Flux query helper
+# ---------------------------------------------------------------------------
 
 def flux_query(query: str) -> list[dict]:
-    """
-    Run a Flux query against InfluxDB v2 and return rows as a list of dicts.
-    Uses the CSV response format and parses it manually (no external deps).
-    """
     url = f"{INFLUXDB_URL}/api/v2/query?org={INFLUXDB_ORG}"
     payload = json.dumps({"query": query, "type": "flux"}).encode()
 
     req = Request(url, data=payload, method="POST")
-    req.add_header("Authorization",  f"Token {INFLUXDB_TOKEN}")
-    req.add_header("Content-Type",   "application/json")
-    req.add_header("Accept",         "application/csv")
+    req.add_header("Authorization", f"Token {INFLUXDB_TOKEN}")
+    req.add_header("Content-Type",  "application/json")
+    req.add_header("Accept",        "application/csv")
 
     try:
-        with urlopen(req, timeout=15) as resp:
+        with urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8")
     except URLError as e:
         body = ""
@@ -140,25 +130,17 @@ def flux_query(query: str) -> list[dict]:
 
 
 def _parse_flux_csv(csv_text: str) -> list[dict]:
-    """Parse InfluxDB annotated CSV into a list of plain dicts.
-    
-    InfluxDB returns multiple table blocks, each with its own header row.
-    We need to reset headers whenever we see a new header row.
-    """
     rows = []
     headers = []
     for line in csv_text.splitlines():
         if not line:
             continue
-        # Annotation rows (#group, #datatype, #default) - skip
         if line.startswith("#"):
             continue
         parts = line.split(",")
-        # Header row: first cell is empty, second cell is "result"
         if parts[0] == "" and len(parts) > 1 and parts[1] == "result":
             headers = parts
             continue
-        # Data row: first cell is empty, second cell is "_result"
         if parts[0] == "" and headers:
             row = dict(zip(headers, parts))
             for k in ("", "result", "table"):
@@ -168,20 +150,22 @@ def _parse_flux_csv(csv_text: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Query builders
+# Duration helpers
 # ---------------------------------------------------------------------------
 
 def _clamp_hours(hours: float) -> float:
-    return max(0.0167, min(hours, MAX_HOURS))  # min ~1 min, max cap
+    return max(0.0167, min(hours, MAX_HOURS))
 
 def _flux_duration(hours: float) -> str:
-    """Convert hours to a Flux duration string using whole minutes (always valid)."""
     minutes = max(1, round(hours * 60))
     return f"{minutes}m"
 
 
+# ---------------------------------------------------------------------------
+# Aircraft queries
+# ---------------------------------------------------------------------------
+
 def query_aircraft_latest(hours: float) -> list[dict]:
-    """Last known position of every aircraft seen in the time window."""
     h = _clamp_hours(hours)
     dur = _flux_duration(h)
     q = f"""
@@ -223,8 +207,7 @@ from(bucket: "{INFLUXDB_BUCKET}")
     return [x for x in out if x["lat"] is not None and x["lon"] is not None]
 
 
-def query_aircraft_track(icao: str, hours: float) -> list[dict]:
-    """Full position track for a single aircraft."""
+def query_aircraft_track(icao: str, hours: float) -> dict:
     h = _clamp_hours(hours)
     dur = _flux_duration(h)
     icao_safe = icao.upper().replace('"', "")
@@ -241,7 +224,7 @@ from(bucket: "{INFLUXDB_BUCKET}")
 """
     rows = flux_query(q)
     db   = ac_lookup(icao)
-    out = []
+    out  = []
     for r in rows:
         try:
             out.append({
@@ -267,8 +250,11 @@ from(bucket: "{INFLUXDB_BUCKET}")
     }
 
 
+# ---------------------------------------------------------------------------
+# Vessel queries
+# ---------------------------------------------------------------------------
+
 def query_vessels_latest(hours: float) -> list[dict]:
-    """Last known position of every vessel seen in the time window."""
     h = _clamp_hours(hours)
     dur = _flux_duration(h)
     q = f"""
@@ -288,17 +274,17 @@ from(bucket: "{INFLUXDB_BUCKET}")
     for r in rows:
         try:
             out.append({
-                "mmsi":     r.get("mmsi", ""),
-                "name":     r.get("shipname", ""),
-                "type":     r.get("shiptype", ""),
-                "country":  r.get("country", ""),
-                "lat":      _f(r.get("lat")),
-                "lon":      _f(r.get("lon")),
-                "speed":    _f(r.get("speed")),
-                "course":   _f(r.get("course")),
-                "heading":  _f(r.get("heading")),
-                "status":   _i(r.get("status")),
-                "time":     r.get("_time", ""),
+                "mmsi":    r.get("mmsi", ""),
+                "name":    r.get("shipname", ""),
+                "type":    r.get("shiptype", ""),
+                "country": r.get("country", ""),
+                "lat":     _f(r.get("lat")),
+                "lon":     _f(r.get("lon")),
+                "speed":   _f(r.get("speed")),
+                "course":  _f(r.get("course")),
+                "heading": _f(r.get("heading")),
+                "status":  _i(r.get("status")),
+                "time":    r.get("_time", ""),
             })
         except (ValueError, KeyError):
             continue
@@ -306,7 +292,6 @@ from(bucket: "{INFLUXDB_BUCKET}")
 
 
 def query_vessel_track(mmsi: str, hours: float) -> list[dict]:
-    """Full position track for a single vessel."""
     h = _clamp_hours(hours)
     dur = _flux_duration(h)
     mmsi_safe = mmsi.replace('"', "")
@@ -338,6 +323,129 @@ from(bucket: "{INFLUXDB_BUCKET}")
 
 
 # ---------------------------------------------------------------------------
+# Stats queries
+# ---------------------------------------------------------------------------
+
+def _parse_duration_min(first_seen: str, last_seen: str):
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%S"
+        t0 = datetime.strptime(first_seen[:19], fmt)
+        t1 = datetime.strptime(last_seen[:19],  fmt)
+        return round((t1 - t0).total_seconds() / 60, 1)
+    except Exception:
+        return None
+
+
+def query_stats_aircraft(hours: float, limit: int = 20) -> dict:
+    h   = _clamp_hours(hours)
+    dur = _flux_duration(h)
+    q = f"""
+from(bucket: "{INFLUXDB_BUCKET}")
+  |> range(start: -{dur})
+  |> filter(fn: (r) => r._measurement == "aircraft")
+  |> filter(fn: (r) => r._field == "Lat")
+  |> group(columns: ["Icao"])
+  |> reduce(
+      identity: {{count: 0, first_seen: "", last_seen: ""}},
+      fn: (r, accumulator) => ({{
+          count:      accumulator.count + 1,
+          first_seen: if accumulator.first_seen == "" or r._time < accumulator.first_seen
+                      then string(v: r._time) else accumulator.first_seen,
+          last_seen:  if accumulator.last_seen == "" or r._time > accumulator.last_seen
+                      then string(v: r._time) else accumulator.last_seen,
+      }})
+  )
+  |> keep(columns: ["Icao", "count", "first_seen", "last_seen"])
+"""
+    rows = flux_query(q)
+
+    entries = []
+    for r in rows:
+        icao = r.get("Icao", "")
+        if not icao:
+            continue
+        db  = ac_lookup(icao)
+        first_seen = r.get("first_seen", "")
+        last_seen  = r.get("last_seen",  "")
+        entries.append({
+            "icao":         icao,
+            "registration": db.get("registration", ""),
+            "type":         db.get("type", ""),
+            "desc":         db.get("desc", ""),
+            "operator":     db.get("operator", ""),
+            "military":     db.get("military", False),
+            "count":        _i(r.get("count")) or 0,
+            "first_seen":   first_seen,
+            "last_seen":    last_seen,
+            "duration_min": _parse_duration_min(first_seen, last_seen),
+        })
+
+    top_count    = sorted(entries, key=lambda x: x["count"],                          reverse=True)[:limit]
+    top_duration = sorted([e for e in entries if e["duration_min"] is not None],
+                          key=lambda x: x["duration_min"],                             reverse=True)[:limit]
+
+    return {
+        "hours":        hours,
+        "unique_count": len(entries),
+        "top_count":    top_count,
+        "top_duration": top_duration,
+    }
+
+
+def query_stats_vessels(hours: float, limit: int = 20) -> dict:
+    h   = _clamp_hours(hours)
+    dur = _flux_duration(h)
+    q = f"""
+from(bucket: "{INFLUXDB_BUCKET}")
+  |> range(start: -{dur})
+  |> filter(fn: (r) => r._measurement == "vessel")
+  |> filter(fn: (r) => r._field == "lat")
+  |> group(columns: ["mmsi", "shipname", "country", "shiptype"])
+  |> reduce(
+      identity: {{count: 0, first_seen: "", last_seen: ""}},
+      fn: (r, accumulator) => ({{
+          count:      accumulator.count + 1,
+          first_seen: if accumulator.first_seen == "" or r._time < accumulator.first_seen
+                      then string(v: r._time) else accumulator.first_seen,
+          last_seen:  if accumulator.last_seen == "" or r._time > accumulator.last_seen
+                      then string(v: r._time) else accumulator.last_seen,
+      }})
+  )
+  |> keep(columns: ["mmsi", "shipname", "country", "shiptype", "count", "first_seen", "last_seen"])
+"""
+    rows = flux_query(q)
+
+    entries = []
+    for r in rows:
+        mmsi = r.get("mmsi", "")
+        if not mmsi:
+            continue
+        first_seen = r.get("first_seen", "")
+        last_seen  = r.get("last_seen",  "")
+        entries.append({
+            "mmsi":         mmsi,
+            "name":         r.get("shipname", ""),
+            "country":      r.get("country", ""),
+            "type":         r.get("shiptype", ""),
+            "count":        _i(r.get("count")) or 0,
+            "first_seen":   first_seen,
+            "last_seen":    last_seen,
+            "duration_min": _parse_duration_min(first_seen, last_seen),
+        })
+
+    top_count    = sorted(entries, key=lambda x: x["count"],                          reverse=True)[:limit]
+    top_duration = sorted([e for e in entries if e["duration_min"] is not None],
+                          key=lambda x: x["duration_min"],                             reverse=True)[:limit]
+
+    return {
+        "hours":        hours,
+        "unique_count": len(entries),
+        "top_count":    top_count,
+        "top_duration": top_duration,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Type helpers
 # ---------------------------------------------------------------------------
 
@@ -358,15 +466,6 @@ def _i(v) -> int | None:
 # HTTP handler
 # ---------------------------------------------------------------------------
 
-ROUTES = {
-    # method  path-prefix                  handler
-    "/api/aircraft":         "aircraft_latest",
-    "/api/aircraft/":        "aircraft_track",   # /api/aircraft/{icao}/track
-    "/api/vessels":          "vessels_latest",
-    "/api/vessels/":         "vessel_track",      # /api/vessels/{mmsi}/track
-    "/api/health":           "health",
-}
-
 class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
@@ -378,13 +477,19 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError):
             return default
 
+    def _get_int(self, qs: dict, key: str, default: int) -> int:
+        try:
+            return int(qs.get(key, [default])[0])
+        except (ValueError, TypeError):
+            return default
+
     def _send_json(self, data, status: int = 200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type",   "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", CORS_ORIGIN)
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control",  "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
@@ -393,7 +498,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", CORS_ORIGIN)
+        self.send_header("Access-Control-Allow-Origin",  CORS_ORIGIN)
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
@@ -404,41 +509,48 @@ class Handler(BaseHTTPRequestHandler):
         qs     = parse_qs(parsed.query)
 
         try:
-            # --- Health ---
             if path == "/api/health":
                 with _ac_db_lock:
                     db_size = len(_ac_db)
                 self._send_json({
                     "status": "ok",
-                    "time": datetime.now(timezone.utc).isoformat(),
+                    "time":   datetime.now(timezone.utc).isoformat(),
                     "ac_db_entries": db_size,
                 })
 
-            # --- Aircraft latest ---
             elif path == "/api/aircraft":
                 hours = self._get_hours(qs, 1.0)
                 data  = query_aircraft_latest(hours)
                 self._send_json({"hours": hours, "count": len(data), "aircraft": data})
 
-            # --- Aircraft track: /api/aircraft/{icao}/track ---
             elif path.startswith("/api/aircraft/") and path.endswith("/track"):
                 icao  = path.split("/")[3]
                 hours = self._get_hours(qs, 1.0)
                 data  = query_aircraft_track(icao, hours)
                 self._send_json({"hours": hours, "count": len(data["track"]), **data})
 
-            # --- Vessels latest ---
+            elif path == "/api/stats/aircraft":
+                hours = self._get_hours(qs, 24.0)
+                limit = self._get_int(qs, "limit", 20)
+                data  = query_stats_aircraft(hours, limit)
+                self._send_json(data)
+
             elif path == "/api/vessels":
                 hours = self._get_hours(qs, 1.0)
                 data  = query_vessels_latest(hours)
                 self._send_json({"hours": hours, "count": len(data), "vessels": data})
 
-            # --- Vessel track: /api/vessels/{mmsi}/track ---
             elif path.startswith("/api/vessels/") and path.endswith("/track"):
                 mmsi  = path.split("/")[3]
                 hours = self._get_hours(qs, 1.0)
                 data  = query_vessel_track(mmsi, hours)
                 self._send_json({"mmsi": mmsi, "hours": hours, "count": len(data), "track": data})
+
+            elif path == "/api/stats/vessels":
+                hours = self._get_hours(qs, 24.0)
+                limit = self._get_int(qs, "limit", 20)
+                data  = query_stats_vessels(hours, limit)
+                self._send_json(data)
 
             else:
                 self._error(404, "Not found")
@@ -463,13 +575,8 @@ def main():
     log.info("  InfluxDB: %s  org=%s  bucket=%s", INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET)
     log.info("  Max query window: %.0fh", MAX_HOURS)
 
-    # Load aircraft DB in background, don't block startup
-    t = threading.Thread(target=_load_ac_db, daemon=True)
-    t.start()
-
-    # Background refresh thread
-    r = threading.Thread(target=_ac_db_refresh_loop, daemon=True)
-    r.start()
+    threading.Thread(target=_load_ac_db,         daemon=True).start()
+    threading.Thread(target=_ac_db_refresh_loop, daemon=True).start()
 
     server = HTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     try:

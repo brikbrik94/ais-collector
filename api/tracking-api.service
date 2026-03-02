@@ -1,0 +1,20 @@
+[Unit]
+Description=OE5ITH Tracking Data API
+After=network-online.target influxdb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/tracking-api.env
+ExecStart=/opt/tracking-api/venv/bin/python3 /opt/tracking-api/api.py
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
